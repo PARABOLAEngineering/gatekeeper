@@ -1,0 +1,171 @@
+#!/bin/bash
+
+THROTTLE_LOG="/tmp/throttle.log"
+touch "$THROTTLE_LOG"
+REFRESH_INTERVAL=2  # seconds between refreshes
+
+# Check dependencies
+command -v trickle >/dev/null || { echo "Install trickle first: sudo apt install trickle"; exit 1; }
+command -v dialog >/dev/null || { echo "Install dialog for interactive UI: sudo apt install dialog"; exit 1; }
+
+# Fast network process finder
+get_network_processes() {
+    ss -tulnp 2>/dev/null | awk '/ESTAB|LISTEN/ {print $7}' | cut -d ',' -f 2 | awk -F '=' '{print $2}' | sort -u | while read -r pid; do
+        [ -f "/proc/$pid/comm" ] && echo "$pid $(cat "/proc/$pid/comm")"
+    done
+}
+
+# Get current throttle status
+get_throttle_status() {
+    local pid=$1
+    if grep -q "^$pid " "$THROTTLE_LOG"; then
+        local limit=$(grep "^$pid " "$THROTTLE_LOG" | awk '{print $2}')
+        if [ "$limit" == "BOOST" ]; then
+            echo "BOOSTED"
+        else
+            echo "THROTTLED ($limit KB/s)"
+        fi
+    else
+        echo "UNMANAGED"
+    fi
+}
+
+# Show help/controls
+show_controls() {
+    dialog --title "Controls Help" \
+           --no-collapse \
+           --msgbox "\
+ARROW KEYS - Navigate menu\n
+ENTER/SPACE - Select option\n
+TAB - Switch between buttons\n
+ESC - Go back/Exit\n
+\n
+Process Status Key:\n
+  BOOSTED - Running at max speed\n
+  THROTTLED - Limited to specified KB/s\n
+  UNMANAGED - No limits applied" 16 60
+}
+
+# Main interactive interface
+show_interface() {
+    while true; do
+        # Get current process list
+        mapfile -t processes < <(get_network_processes)
+        
+        # Prepare dialog menu items
+        declare -a menu_items=()
+        for i in "${!processes[@]}"; do
+            pid=$(echo "${processes[$i]}" | awk '{print $1}')
+            pname=$(echo "${processes[$i]}" | awk '{print $2}')
+            status=$(get_throttle_status "$pid")
+            menu_items+=("$pid" "$pname ($status)")
+        done
+        
+        # Show dialog menu
+        choice=$(dialog --clear \
+                --title "Network Throttle Manager (Auto-refresh: $REFRESH_INTERVAL secs)" \
+                --help-button \
+                --help-status \
+                --menu "↓↑ Select process | ENTER Confirm | F1 Help" \
+                20 70 10 \
+                "${menu_items[@]}" \
+                "REFRESH" "⟳ Force Refresh Now" \
+                "HELP" "ℹ Show Controls Help" \
+                "EXIT" "🚪 Quit Program" \
+                2>&1 >/dev/tty)
+        
+        # Check if help button was pressed
+        if [[ "$choice" =~ ^HELP ]]; then
+            show_controls
+            continue
+        fi
+        
+        # Handle selection
+        case "$choice" in
+            "")
+                # Dialog was closed, exit
+                clear
+                exit 0
+                ;;
+            "REFRESH")
+                # Just continue to refresh
+                continue
+                ;;
+            "HELP")
+                show_controls
+                continue
+                ;;
+            "EXIT")
+                clear
+                exit 0
+                ;;
+            *)
+                # Process selected - show action menu
+                pid=$choice
+                pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+                current_status=$(get_throttle_status "$pid")
+                
+                action=$(dialog --clear \
+                        --title "Manage $pname (PID: $pid)" \
+                        --help-button \
+                        --menu "Current: $current_status\n↓↑ Navigate | ENTER Select | ESC Back" \
+                        15 60 5 \
+                        "THROTTLE" "↓ Limit bandwidth (KB/s)" \
+                        "BOOST" "↑ Maximize bandwidth" \
+                        "REMOVE" "✖ Remove all limits" \
+                        "BACK" "← Return to main menu" \
+                        2>&1 >/dev/tty)
+                
+                # Check if help button was pressed
+                if [[ "$action" =~ ^HELP ]]; then
+                    show_controls
+                    continue
+                fi
+                
+                case "$action" in
+                    "THROTTLE")
+                        limit=$(dialog --inputbox "Enter bandwidth limit in KB/s:\n(Example: 100 for 100KB/s limit)" 10 50 2>&1 >/dev/tty)
+                        if [[ "$limit" =~ ^[0-9]+$ ]]; then
+                            pkill -f "trickle.*-n $pid"
+                            trickle -d "$limit" -u "$limit" -n "$pid" &
+                            sed -i "/^$pid /d" "$THROTTLE_LOG"
+                            echo "$pid $limit $pname" >> "$THROTTLE_LOG"
+                            dialog --msgbox "✅ Throttled $pname (PID: $pid) to $limit KB/s" 8 50
+                        else
+                            dialog --msgbox "❌ Invalid input. Please enter a number." 8 50
+                        fi
+                        ;;
+                    "BOOST")
+                        pkill -f "trickle.*-n $pid"
+                        trickle -d 99999 -u 99999 -n "$pid" &
+                        sed -i "/^$pid /d" "$THROTTLE_LOG"
+                        echo "$pid BOOST $pname" >> "$THROTTLE_LOG"
+                        dialog --msgbox "🚀 Boosted $pname (PID: $pid) to maximum bandwidth" 8 50
+                        ;;
+                    "REMOVE")
+                        pkill -f "trickle.*-n $pid"
+                        sed -i "/^$pid /d" "$THROTTLE_LOG"
+                        dialog --msgbox "🔓 Removed all limits from $pname (PID: $pid)" 8 50
+                        ;;
+                    "BACK"|"")
+                        continue
+                        ;;
+                esac
+                ;;
+        esac
+        
+        # Small delay before refresh
+        sleep "$REFRESH_INTERVAL"
+    done
+}
+
+# Start with controls explanation
+dialog --title "Welcome to Network Throttle Manager" \
+       --yesno "This tool lets you control network bandwidth for processes.\n\nShow quick controls guide first?" 10 60
+
+if [ $? -eq 0 ]; then
+    show_controls
+fi
+
+# Start the interface
+show_interface
